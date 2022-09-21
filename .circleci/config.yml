@@ -1,0 +1,163 @@
+version: 2.1
+executors:
+  node:
+    working_directory: ~/build
+    docker:
+      - image: minutrade/circleci-build-node:14.17.5
+        auth:
+          username: $DOCKER_USER
+          password: $DOCKER_PASSWORD
+        environment:
+          TEST_REPORT_PATH: reports/npm-test.txt
+          OUTDATED_REPORT_PATH: reports/npm-outdated.txt
+
+commands:
+###############CLONE REPOS#########################
+  get_minu_deploy_toolkit:
+    description: Get Minu Deploy Toolkit
+    steps:
+      - run: |
+          cd /
+          git clone -b cicd-pipeline-template https://$MTCLI_GITHUB_API_TOKEN@github.com/Minutrade/minutrade-deploy-toolkit.git
+          cd minutrade-deploy-toolkit
+          npm ci
+          cd ~/build
+  get_minu_deploy_dev-manifests:
+    description: Get Minu Dev Manifests Repo
+    steps:
+      - run: |
+          cd /
+          git clone https://$MTCLI_GITHUB_API_TOKEN@github.com/Minutrade/k8s-manifests-dev.git
+  get_minu_deploy_hmg-manifests:
+    description: Get Minu Hmg Manifests Repo
+    steps:
+      - run: |
+          cd /
+          git clone https://$MTCLI_GITHUB_API_TOKEN@github.com/Minutrade/k8s-manifests-hmg.git
+  get_minu_deploy_prd-manifests:
+    description: Get Minu Prd Manifests Repo
+    steps:
+      - run: |
+          cd /
+          git clone https://$MTCLI_GITHUB_API_TOKEN@github.com/Minutrade/k8s-manifests-prd.git
+jobs:
+###############BUILD#########################
+  build:
+    executor: node
+    steps:
+      - checkout
+      - setup_remote_docker:
+          version: 19.03.13
+      - get_minu_deploy_toolkit
+      - restore_cache:
+          keys:
+            - v1-dependencies-{{ checksum "package-lock.json" }}
+      - run:
+          name: Installing NPM Modules
+          command: npm ci
+      - save_cache:
+          paths:
+            - node_modules
+          key: v1-dependencies-{{ checksum "package-lock.json" }}
+      ##- run:
+      #    name: Publishing Sonar Report
+      #    command: |
+      #      if [ "$CIRCLE_BRANCH" == "master" ]; then
+      #        /sonar-scanner/bin/sonar-scanner \
+      #        -Dsonar.login=${SONAR_USER} \
+      #        -Dsonar.password=${SONAR_PASSWORD} \
+      #        -Dsonar.host.url=${SONAR_HOST_URL} \
+      #        -Dsonar.projectVersion=$(node -p -e "require('./package.json').version");
+      #      fi
+      #- run:
+      #    name: Bulding application
+      #    command: npm run build
+      - run:
+          name: Building and Publishing Image
+          command: |
+            bash /minutrade-deploy-toolkit/scripts/publish-docker-image.sh
+      - store_artifacts:
+          path: reports
+
+###############DEPLOY#########################
+  argocd-push-master:
+    executor: node
+    parameters:
+      branch:
+        type: string
+        default: master
+      environment:
+        type: string
+      istiodeploy:
+        type: boolean
+        default: true
+    steps:
+      - checkout
+      - get_minu_deploy_toolkit
+      - get_minu_deploy_dev-manifests
+      - run:
+          name: Update manifest for ArgoCD running in <<parameters.environment>>
+          command: |
+            export GIT_BRANCH=<< parameters.branch >>
+            export ENVIRONMENT=<< parameters.environment >>
+            export ISTIODEPLOY=<< parameters.istiodeploy >>
+            bash /minutrade-deploy-toolkit/scripts/argocd-trigger-open-push-on-branch.sh
+  argocd-pull-request:
+    executor: node
+    parameters:
+      environment:
+        type: string
+      istiodeploy:
+        type: boolean
+        default: true
+    steps:
+      - checkout
+      - get_minu_deploy_toolkit
+      - get_minu_deploy_<< parameters.environment >>-manifests
+      - run:
+          name: Open PR to << parameters.environment >> Manifests.
+          command: |
+            export ENVIRONMENT=<< parameters.environment >>
+            export ISTIODEPLOY=<< parameters.istiodeploy >>
+            bash /minutrade-deploy-toolkit/scripts/argocd-trigger-open-git-pr.sh
+
+###############WORKFLOWS########################
+workflows:
+  version: 2
+  automated-deploy-process:
+    jobs:
+###############BUILD#########################
+      - build:
+          context: org-global
+###############DEV#########################
+      - argocd-push-master:
+          environment: dev
+          istiodeploy: true
+          name: DEV-Manifest-Update-ARGOCD
+          context: org-global
+          requires:
+            - build
+###############HOMOLOG##########################
+      - argocd-pull-request:
+          environment: hmg
+          istiodeploy: true
+          name: HMG-Open-PR-manifest-k8s-to-ARGOCD
+          context: org-global
+          filters:
+            branches:
+              only:
+                - master
+          requires:
+            - DEV-Manifest-Update-ARGOCD
+###############PRODUCTION#########################
+      - argocd-pull-request:
+          environment: prd
+          istiodeploy: true
+          name: PRD-Open-PR-manifest-k8s-to-ARGOCD
+          context: org-global
+          filters:
+            branches:
+              only:
+                - master
+          requires:
+            - HMG-Open-PR-manifest-k8s-to-ARGOCD

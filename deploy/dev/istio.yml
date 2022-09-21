@@ -1,0 +1,19 @@
+apiVersion: networking.istio.io/v1alpha3
+kind: VirtualService
+metadata:
+  name: vs-_APP_NAME_
+  namespace: _NAMESPACE_
+spec:
+  hosts:
+    - "example-poc-dev.minu.co"
+  gateways:
+    - default/_ISTIO_GATEWAY_
+  http:
+    - route: /
+        - destination:
+            host: microservice-example
+      timeout: 30s
+    - route: /admin
+               - destination:
+               host: microservice-example-admin
+      timeout: 30s
